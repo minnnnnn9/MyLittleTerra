@@ -1,0 +1,114 @@
+﻿using MLT;
+using MLT.Core;
+using MLT.Data;
+using MLT.Data.ItemSO;
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace MLT.Machine
+{
+    public struct SeedOutput
+    {
+        public ItemSeedData Seed;
+        public int Amount;
+    }
+
+    /// <summary>
+    /// 기계별 상태를 독립적으로 관리.
+    /// _progressValue를 전역으로 두지 않고 ExtractorState 안에 포함시켜
+    /// 여러 기계 동시 작동(버그3), UI 진행도 오류를 해결합니다.
+    /// </summary>
+
+
+    public class SeedExtractorManager : MonoBehaviour
+    {
+        public static SeedExtractorManager Instance { get; private set; }
+
+        [SerializeField] private SeedExtractorConfigData _config;
+
+        // 기계 위치 → 상태 (각 기계 독립)
+        private readonly Dictionary<Vector3Int, ExtractorState> _states = new();
+
+        private void Awake()
+        {
+            if (Instance != null && Instance != this) { Destroy(gameObject); return; }
+            Instance = this;
+        }
+
+        private void Update()
+        {
+            if (TimeManager.Instance == null) return;
+
+            foreach (var kvp in _states)
+            {
+                var state = kvp.Value;
+                if (!state.IsProcessing) continue;
+
+                float elapsed = TimeManager.Instance.TotalMinutes - state.LastCycleMinute;
+
+                // 기계별 진행도 갱신
+                state.Progress = Mathf.Clamp01(elapsed / _config.ProcessingMinutes);
+
+                if (elapsed >= _config.ProcessingMinutes)
+                {
+                    ProcessOneCycle(kvp.Key, state);
+                }
+            }
+        }
+
+        private void ProcessOneCycle(Vector3Int pos, ExtractorState state)
+        {
+            if (state.InputQueue.Count == 0) { state.IsProcessing = false; return; }
+
+            var crop = state.InputQueue.Dequeue();
+
+            ItemSeedData seed = (Random.value < _config.AncientSeedChance)
+                ? _config.AncientSeed
+                : FindSeed(crop);
+
+            if (seed != null)
+            {
+                int amount = Random.Range(_config.MinOutput, _config.MaxOutput + 1);
+                state.OutputQueue.Enqueue(new SeedOutput { Seed = seed, Amount = amount });
+                EventBus.RaiseSeedCollected(seed, amount);
+            }
+
+            state.LastCycleMinute += _config.ProcessingMinutes;
+            state.Progress = 0f;
+            state.IsProcessing = state.InputQueue.Count > 0;
+        }
+
+        public void InsertCrops(Vector3Int pos, List<ItemCropData> crops)
+        {
+            if (!_states.ContainsKey(pos)) _states[pos] = new ExtractorState();
+            var state = _states[pos];
+
+            foreach (var crop in crops) state.InputQueue.Enqueue(crop);
+
+            if (!state.IsProcessing)
+            {
+                state.LastCycleMinute = TimeManager.Instance.TotalMinutes;
+                state.IsProcessing = true;
+                state.Progress = 0f;
+            }
+        }
+
+        public ExtractorState GetState(Vector3Int pos)
+            => _states.TryGetValue(pos, out var s) ? s : null;
+
+        /// <summary>
+        /// UI에서 특정 기계의 진행도를 가져올 때 사용 (버그3 해결)
+        /// </summary>
+        public float GetProgress(Vector3Int pos)
+        {
+            var state = GetState(pos);
+            return state?.Progress ?? 0f;
+        }
+
+        private ItemSeedData FindSeed(ItemCropData crop)
+        {
+            var recipe = _config.Recipes.Find(r => r.Crop == crop);
+            return recipe.Seed; // struct default면 null 반환
+        }
+    }
+}

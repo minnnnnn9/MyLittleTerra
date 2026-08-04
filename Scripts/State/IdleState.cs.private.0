@@ -1,0 +1,82 @@
+﻿using MLT.Core;
+using UnityEngine;
+using MLT.Data.ItemSO;
+
+namespace MLT.Player
+{
+    public class IdleState : IPlayerState
+    {
+        public void Enter(PlayerController player)
+        {
+            player.Animator.SetIdle();
+        }
+
+        public void Tick(PlayerController player)
+        {
+            if (player.Input.InventoryPressed)
+            {
+                player.ChangeState(new InventoryState());
+                return;
+            }
+
+
+            if (player.Input.InteractPressed)
+            {
+                var selectedItem = player.Data.Inventory.GetSelectedItem();
+
+                if (selectedItem is ItemPlaceableData)
+                {
+                    player.TryPlaceSelectedItem();
+                    return;
+                }
+
+                var tool = player.Data.Inventory.GetCurrentToolData(); // ItemToolData인 경우
+                ToolType currentTool = ToolManager.Instance?.CurrentTool ?? ToolType.NONE;
+
+                if (tool != null && tool._toolType != ToolType.NONE)
+                {
+                    // 도구 (호미, 물조리개, 낫 등) - 기존 그대로
+                    var context = player.Interactor.CreateToolActionContext(tool);
+                    Vector2 dir = player.Interactor.GetMouseCellDirectionFromPlayer();
+                    player.BeginToolAction(context, tool, dir);
+                }
+                else if (currentTool == ToolType.SEED || currentTool == ToolType.FERTILIZER)
+                {
+                    // 씨앗/비료 - ToolGrade.NONE으로 셀 1칸 대상 명령서 생성
+                    var cells = player.Interactor.GetFarmingTargetCells(ToolType.SEED,ToolGrade.NONE); // 매개변수 고쳐야함 (중요 !!!!!!!!!!! 꼭 )
+                    var context = new ToolActionContext
+                    {
+                        ToolType = currentTool,
+                        Grade = ToolGrade.NONE,
+                        ToolData = null,
+                        TargetCells = cells
+                    };
+                    Vector2 dir = player.Interactor.GetMouseCellDirectionFromPlayer();
+
+
+                    if (dir.sqrMagnitude > 0.001f)
+                        player.Animator.FaceDirection(dir);
+                    context.Execute(player);
+                }
+                else
+                {
+                    player.Interactor.TryInteractByMouse();
+                }
+                return;
+            }
+
+            if (player.Input.Move.sqrMagnitude > 0.01f)
+            {
+                player.ChangeState(new MoveState());
+                return;
+            }
+
+            player.Animator.SetIdle();
+        }
+
+        public void Exit(PlayerController player)
+        {
+        }
+    }
+}
+

@@ -1,0 +1,178 @@
+﻿using MLT.Core;
+using MLT.Utils;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.InputSystem;
+using UnityEngine.Tilemaps;
+using MLT.Data.ItemSO;
+
+namespace MLT.Player
+{
+    public class PlayerInteractor : MonoBehaviour
+    {
+        [SerializeField] private float _cellCheckRadius = 0.45f;
+        [SerializeField] private LayerMask _interactableLayer;
+        [SerializeField] private Tilemap _referenceTilemap;
+        [SerializeField] private Camera _mainCamera;
+
+        private PlayerController _player;
+
+        private void Awake()
+        {
+            _player = GetComponent<PlayerController>();
+            if (_mainCamera == null) _mainCamera = Camera.main;
+        }
+
+        public ToolActionContext CreateToolActionContext(ItemToolData toolData)
+        {
+            if (toolData == null) return null;
+
+            var context = new ToolActionContext
+            {
+                ToolType = toolData._toolType,
+                Grade = toolData._grade,
+                ToolData = toolData
+            };
+
+            // ── 버그8 핵심 ──────────────────────────────────────────
+            // 낫(SCYTHE)은 타일 작업이므로 IInteractable 탐색을 건너뜁니다.
+            // 기존 코드는 낫으로 사용해도 FindMouseTargetInPlayerRange()에서
+            // 설치물을 먼저 감지하면 TargetCells가 비어서 수확이 안 됐습니다.
+            // ─────────────────────────────────────────────────────────
+            bool isFarmingTool = toolData._toolType == ToolType.SCYTHE
+                              || toolData._toolType == ToolType.HOE
+                              || toolData._toolType == ToolType.WATERING_CAN;
+
+            if (!isFarmingTool)
+            {
+                IInteractable targetObj = FindMouseTargetInPlayerRange();
+                if (targetObj != null)
+                {
+                    context.TargetObject = targetObj;
+                    Debug.Log($"[명령서 발행] 대상: {targetObj.GetType().Name}");
+                    return context;
+                }
+            }
+
+            // 타일 대상 농사/수확
+            context.TargetCells = GetFarmingTargetCells(toolData._toolType, toolData._grade);
+            Debug.Log($"[명령서 발행] 대상: 타일 {context.TargetCells.Count}칸");
+            return context;
+        }
+
+        /// <summary>
+        /// 버그7: 농사 도구는 플레이어 기준 동서남북 1칸 범위로만 작동.
+        /// 등급 업그레이드 시 확장되는 방식은 그대로 유지.
+        /// </summary>
+        public List<Vector3Int> GetFarmingTargetCells(ToolType toolType, ToolGrade grade)
+        {
+            var cells = new List<Vector3Int>();
+
+            if (_referenceTilemap == null || _mainCamera == null || Mouse.current == null)
+                return cells;
+
+            Vector2 mouseScreen = Mouse.current.position.ReadValue();
+            Vector3 mouseWorld = _mainCamera.ScreenToWorldPoint(mouseScreen);
+            mouseWorld.z = 0f;
+
+            Vector3Int targetCell = _referenceTilemap.WorldToCell(mouseWorld);
+            Vector3Int playerCell = _referenceTilemap.WorldToCell(transform.position);
+
+            // ── 버그7 핵심: 농사 도구는 플레이어 인접 4방향(상하좌우 1칸)만 허용
+            if (!IsAdjacentToPlayer(playerCell, targetCell))
+            {
+                Debug.Log("[농사] 플레이어 인접 범위(4방향 1칸) 밖");
+                return cells;
+            }
+
+            Vector2 dir = GetMouseCellDirectionFromPlayer();
+            Vector3Int dirInt = new(Mathf.RoundToInt(dir.x), Mathf.RoundToInt(dir.y), 0);
+
+            switch (grade)
+            {
+                case ToolGrade.NONE:
+                    cells.Add(targetCell);
+                    break;
+                case ToolGrade.COPPER:
+                    for (int i = 0; i < 3; i++) cells.Add(targetCell + dirInt * i);
+                    break;
+                case ToolGrade.IRON:
+                    for (int i = 0; i < 5; i++) cells.Add(targetCell + dirInt * i);
+                    break;
+                case ToolGrade.GOLD:
+                    for (int x = -1; x <= 1; x++)
+                        for (int y = -1; y <= 1; y++)
+                            cells.Add(targetCell + new Vector3Int(x, y, 0));
+                    break;
+            }
+
+            return cells;
+        }
+
+        /// <summary>
+        /// 플레이어 기준 동서남북 딱 1칸 인접 여부 확인 (버그7)
+        /// </summary>
+        private bool IsAdjacentToPlayer(Vector3Int playerCell, Vector3Int targetCell)
+        {
+            int dx = Mathf.Abs(targetCell.x - playerCell.x);
+            int dy = Mathf.Abs(targetCell.y - playerCell.y);
+            // 대각선 제외: 상하좌우 1칸만 허용
+            return (dx == 1 && dy == 0) || (dx == 0 && dy == 1) || (dx == 0 && dy == 0);
+        }
+
+        public IInteractable FindMouseTargetInPlayerRange()
+        {
+            if (_referenceTilemap == null || _mainCamera == null || Mouse.current == null)
+                return null;
+
+            Vector2 mouseScreen = Mouse.current.position.ReadValue();
+            Vector3 mouseWorld = _mainCamera.ScreenToWorldPoint(mouseScreen);
+            mouseWorld.z = 0f;
+
+            Vector3Int targetCell = _referenceTilemap.WorldToCell(mouseWorld);
+            Vector3Int playerCell = _referenceTilemap.WorldToCell(transform.position);
+
+            if (!GridUtil.IsWithin3x3(playerCell, targetCell))
+            {
+                Debug.Log("[Interact] 마우스 위치가 플레이어 상호작용 범위 밖");
+                return null;
+            }
+
+            Vector3 targetWorldCenter = _referenceTilemap.GetCellCenterWorld(targetCell);
+            Collider2D hit = Physics2D.OverlapCircle(targetWorldCenter, _cellCheckRadius, _interactableLayer);
+
+            if (hit == null) return null;
+
+            IInteractable interactable = hit.GetComponent<IInteractable>()
+                                      ?? hit.GetComponentInParent<IInteractable>();
+
+            if (interactable == null || !interactable.CanInteract(_player)) return null;
+
+            return interactable;
+        }
+
+        public void TryInteractByMouse()
+        {
+            FindMouseTargetInPlayerRange()?.Interact(_player);
+        }
+
+        public Vector2 GetMouseCellDirectionFromPlayer()
+        {
+            if (_referenceTilemap == null || _mainCamera == null || Mouse.current == null)
+                return Vector2.zero;
+
+            Vector2 mouseScreen = Mouse.current.position.ReadValue();
+            Vector3 mouseWorld = _mainCamera.ScreenToWorldPoint(mouseScreen);
+            mouseWorld.z = 0f;
+
+            Vector3Int targetCell = _referenceTilemap.WorldToCell(mouseWorld);
+            Vector3Int playerCell = _referenceTilemap.WorldToCell(transform.position);
+            Vector3Int diff = targetCell - playerCell;
+
+            if (diff.x != 0) return new Vector2(Mathf.Sign(diff.x), 0f);
+            if (diff.y != 0) return new Vector2(0f, Mathf.Sign(diff.y));
+
+            return Vector2.zero;
+        }
+    }
+}

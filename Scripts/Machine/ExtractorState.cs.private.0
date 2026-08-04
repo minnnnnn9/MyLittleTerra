@@ -1,0 +1,18 @@
+﻿using MLT.Data.ItemSO;
+using MLT.Machine;
+using System.Collections.Generic;
+
+/// <summary>
+/// 기계별 상태를 독립적으로 관리.
+/// _progressValue를 전역으로 두지 않고 ExtractorState 안에 포함시켜
+/// 여러 기계 동시 작동(버그3), UI 진행도 오류를 해결합니다.
+/// </summary>
+
+public class ExtractorState
+{
+    public Queue<ItemCropData> InputQueue = new();
+    public Queue<SeedOutput> OutputQueue = new();
+    public bool IsProcessing;
+    public float LastCycleMinute;
+    public float Progress; // ← 기계별 진행도 (버그3 핵심 수정)
+}

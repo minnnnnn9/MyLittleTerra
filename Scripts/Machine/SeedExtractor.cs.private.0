@@ -1,0 +1,35 @@
+﻿using MLT.Core;
+using MLT.Player;
+using UnityEngine;
+
+namespace MLT.Machine
+{
+    /// <summary>
+    /// 변경점:
+    /// EventBus.RaiseOpenExtractorUI 대신 ExtractorUI를 직접 찾아서 OpenUI(pos) 호출.
+    /// EventBus 방식은 "마지막으로 구독한 UI 하나만" 반응해서 다중 기계 작동 불가(버그3) 원인이었음.
+    /// </summary>
+    public class SeedExtractor : InstallableObject
+    {
+        // 씬에 ExtractorUI가 하나라면 Inspector에서 직접 연결, 없으면 Find 사용
+        [SerializeField] private ExtractorUI _extractorUI;
+
+        private void Start()
+        {
+            if (_extractorUI == null)
+                _extractorUI = FindFirstObjectByType<ExtractorUI>(FindObjectsInactive.Include);
+        }
+
+        public override void OnInteract(PlayerController player)
+        {
+            if (_extractorUI == null)
+            {
+                Debug.LogWarning("[SeedExtractor] ExtractorUI 참조 없음");
+                return;
+            }
+            _extractorUI.OpenUI(this.CellPos);
+        }
+
+        public override void OnDayPassed() { }
+    }
+}

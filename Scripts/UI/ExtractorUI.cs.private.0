@@ -1,0 +1,219 @@
+﻿using MLT.Core;
+using MLT.Data.ItemSO;
+using MLT.Machine;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.UI;
+
+/// <summary>
+/// 리팩토링 핵심:
+/// - OnEnable에서 반드시 RefreshUI() 호출 (버그5: 처음 열면 재료 안 넣어지는 문제)
+/// - 슬롯 클릭은 UI 표시만 변경, 실제 데이터는 OnClickExtractButton 시점에만 Manager에 전달 (버그4,6)
+/// - 결과 수령 시 OutputQueue에서 Dequeue하고 인벤토리로 이동 (복사버그 해결)
+/// - GetProgress(pos) 호출로 기계별 진행도 사용 (버그3)
+/// </summary>
+public class ExtractorUI : MonoBehaviour
+{
+    [SerializeField] private ExtractorSlot _insertSlot;   // UI 임시 보관 슬롯 (투입 전)
+    [SerializeField] private ExtractorSlot _queueSlot;    // Manager의 처리 대기열 표시
+    [SerializeField] private ExtractorSlot _resultSlot;   // Manager의 완성품 표시
+    [SerializeField] private Image _progressImage;
+
+    private Vector3Int _currentMachinePos;
+    private bool _isOpen;
+
+    // ── 생명주기 ──────────────────────────────────────────────
+
+    private void OnEnable()
+    {
+        EventBus.OnSeedCollected += HandleSeedCollected;
+        EventBus.OnCloseAllMachineUI += CloseUI;
+
+        _insertSlot.OnLeftClicked += OnSlotClicked;
+        _resultSlot.OnLeftClicked += OnResultSlotClicked;
+
+        // 버그5 핵심: UI가 활성화될 때마다 반드시 현재 기계 상태로 갱신
+        if (_isOpen) RefreshUI();
+    }
+
+    private void OnDisable()
+    {
+        EventBus.OnSeedCollected -= HandleSeedCollected;
+        EventBus.OnCloseAllMachineUI -= CloseUI;
+
+        _insertSlot.OnLeftClicked -= OnSlotClicked;
+        _resultSlot.OnLeftClicked -= OnResultSlotClicked;
+
+        // 버그4 핵심: UI 닫을 때 _insertSlot에 아이템이 남아있으면 커서로 돌려줌
+        ReturnInsertSlotToCursor();
+    }
+
+    private void Update()
+    {
+        if (!_isOpen) return;
+        _progressImage.fillAmount = SeedExtractorManager.Instance.GetProgress(_currentMachinePos);
+    }
+
+    // ── 공개 API ──────────────────────────────────────────────
+
+    /// <summary>SeedExtractor.OnInteract에서 호출</summary>
+    public void OpenUI(Vector3Int machinePos)
+    {
+        _currentMachinePos = machinePos;
+        _isOpen = true;
+        _insertSlot.Clear(); // 이전 기계의 UI 잔재 제거
+        RefreshUI();
+        gameObject.SetActive(true);
+    }
+
+    public void CloseUI()
+    {
+        _isOpen = false;
+        gameObject.SetActive(false);
+    }
+
+    // ── 버튼 핸들러 ───────────────────────────────────────────
+
+    /// <summary>
+    /// "추출 시작" 버튼.
+    /// _insertSlot의 아이템을 Manager에 넘긴 후 슬롯을 비웁니다.
+    /// </summary>
+    public void OnClickExtractButton()
+    {
+        if (_insertSlot.Item is not ItemCropData crop) return;
+
+        int count = _insertSlot.Amount;
+        var list = new List<ItemCropData>(count);
+        for (int i = 0; i < count; i++) list.Add(crop);
+
+        SeedExtractorManager.Instance.InsertCrops(_currentMachinePos, list);
+        _insertSlot.Clear();
+        RefreshUI();
+    }
+
+    /// <summary>
+    /// "결과 수령" — OutputQueue에서 꺼내 인벤토리에 직접 추가.
+    /// 수령 후 슬롯을 비워 복사 버그(버그4) 방지.
+    /// </summary>
+    public void OnClickCollectButton()
+    {
+        var state = SeedExtractorManager.Instance.GetState(_currentMachinePos);
+        if (state == null || state.OutputQueue.Count == 0) return;
+
+        while (state.OutputQueue.Count > 0)
+        {
+            var output = state.OutputQueue.Dequeue();
+            EventBus.RaiseSeedCollected(output.Seed, output.Amount); // 인벤토리에 추가
+        }
+
+        RefreshUI();
+    }
+
+    // ── 슬롯 클릭 ─────────────────────────────────────────────
+
+    /// <summary>투입 슬롯 클릭 - 커서 ↔ 슬롯 교환 (UI 레벨만)</summary>
+    private void OnSlotClicked(ExtractorSlot slot)
+    {
+        var cursor = CursorManager.Instance.CursorSlot;
+
+        if (slot.Item == null)
+        {
+            if (cursor.IsEmpty) return;
+            // 작물 데이터만 투입 허용
+            if (cursor.Item is not ItemCropData) return;
+            slot.SetItem(cursor.Item, cursor.Quantity);
+            cursor.Clear();
+        }
+        else
+        {
+            if (cursor.IsEmpty)
+            {
+                cursor.SetCursorSlot(slot.Item, slot.Amount);
+                slot.Clear();
+            }
+            else
+            {
+                // 커서가 작물일 때만 교체 허용
+                if (cursor.Item is not ItemCropData) return;
+                var tempItem = slot.Item;
+                int tempAmount = slot.Amount;
+                slot.SetItem(cursor.Item, cursor.Quantity);
+                cursor.SetCursorSlot(tempItem, tempAmount);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 결과 슬롯 클릭 - Manager OutputQueue에서 직접 수령.
+    /// 버그4(복사 현상) 핵심 수정: UI 슬롯 값을 커서로 옮기는 대신
+    /// Manager 큐에서 꺼내서 인벤토리로 이동시킴.
+    /// </summary>
+    private void OnResultSlotClicked(ExtractorSlot slot)
+    {
+        if (slot.Item == null) return;
+        OnClickCollectButton();
+    }
+
+    // ── 내부 유틸 ─────────────────────────────────────────────
+
+    private void HandleSeedCollected(ItemSeedData seed, int amount)
+    {
+        if (_isOpen) RefreshUI();
+    }
+
+    /// <summary>
+    /// Manager 상태를 그대로 읽어 UI를 동기화.
+    /// 버그6 핵심: UI 닫고 열어도 항상 최신 상태 반영.
+    /// </summary>
+    private void RefreshUI()
+    {
+        var state = SeedExtractorManager.Instance.GetState(_currentMachinePos);
+
+        if (state == null)
+        {
+            _queueSlot.Clear();
+            _resultSlot.Clear();
+            return;
+        }
+
+        // 대기열 슬롯
+        if (state.InputQueue.Count > 0)
+            _queueSlot.SetItem(state.InputQueue.Peek(), state.InputQueue.Count);
+        else
+            _queueSlot.Clear();
+
+        // 결과 슬롯
+        int totalAmount = 0;
+        ItemSeedData lastSeed = null;
+        foreach (var o in state.OutputQueue)
+        {
+            lastSeed = o.Seed;
+            totalAmount += o.Amount;
+        }
+
+        if (lastSeed != null) _resultSlot.SetItem(lastSeed, totalAmount);
+        else _resultSlot.Clear();
+    }
+
+    /// <summary>
+    /// UI 닫힐 때 _insertSlot(아직 투입 안 된 아이템)을 커서로 반환.
+    /// 버그4(UI 닫으면 재료 사라짐) 해결.
+    /// </summary>
+    private void ReturnInsertSlotToCursor()
+    {
+        if (_insertSlot.Item == null) return;
+
+        var cursor = CursorManager.Instance?.CursorSlot;
+        if (cursor != null && cursor.IsEmpty)
+        {
+            cursor.SetCursorSlot(_insertSlot.Item, _insertSlot.Amount);
+        }
+        else
+        {
+            // 커서도 차있으면 인벤토리로 직접 추가 시도
+            EventBus.RaiseItemConsumed(_insertSlot.Item, -_insertSlot.Amount); // 음수 = 추가
+        }
+
+        _insertSlot.Clear();
+    }
+}

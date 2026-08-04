@@ -1,0 +1,126 @@
+﻿using UnityEngine;
+using UnityEngine.EventSystems;
+using UnityEngine.InputSystem;
+using UnityEngine.Tilemaps;
+using MLT.Utils;
+using MLT.World;
+using MLT.Machine;
+
+namespace MLT.Player
+{
+    public class PlayerPlacement : MonoBehaviour
+    {
+        [Header("참조")]
+        [SerializeField] private Camera _mainCamera;
+        [SerializeField] private Tilemap _referenceTilemap;
+
+        [Header("설치 차단 레이어")]
+        [SerializeField] private LayerMask _blockingLayerMask;
+
+        [SerializeField] private Transform _parent;
+
+        private PlayerController _player;
+
+        private void Awake()
+        {
+            _player = GetComponent<PlayerController>();
+            if (_mainCamera == null) _mainCamera = Camera.main;
+        }
+
+        public bool TryPlace(GameObject prefab, Vector2Int size)
+        {
+            if (prefab == null) { Debug.LogWarning("[Placement] prefab null"); return false; }
+            if (_mainCamera == null || _referenceTilemap == null) { Debug.LogWarning("[Placement] Camera 또는 Tilemap 연결 안 됨"); return false; }
+            if (Mouse.current == null) { Debug.LogWarning("[Placement] Mouse.current null"); return false; }
+            if (EventSystem.current != null && EventSystem.current.IsPointerOverGameObject()) return false;
+
+            if (size.x <= 0 || size.y <= 0) size = Vector2Int.one;
+
+            // ── 마우스 → 셀 좌표 변환
+            Vector2 mouseScreenPos = Mouse.current.position.ReadValue();
+            Vector3 mouseWorld = _mainCamera.ScreenToWorldPoint(mouseScreenPos);
+            mouseWorld.z = 0f;
+
+            Vector3Int targetCell = _referenceTilemap.WorldToCell(mouseWorld);
+            Vector3Int playerCell = _referenceTilemap.WorldToCell(transform.position);
+
+            if (!GridUtil.IsWithin3x3(playerCell, targetCell))
+            {
+                Debug.Log($"[Placement] 범위 밖 player={playerCell}, target={targetCell}");
+                return false;
+            }
+
+            // ── 버그2: WorldObjectManager 딕셔너리 이중 체크
+            if (WorldObjectManager.Instance != null && WorldObjectManager.Instance.GetObject(targetCell) != null)
+            {
+                Debug.Log($"[Placement] 이미 설치된 오브젝트가 있습니다 cell={targetCell}");
+                return false;
+            }
+
+            if (!CanPlaceAt(targetCell, size))
+            {
+                Debug.Log($"[Placement] 설치 위치 막힘 cell={targetCell}, size={size}");
+                return false;
+            }
+
+            // ── 버그1 핵심: GetCellCenterWorld로 정중앙 좌표 사용
+            Vector3 cellCenterWorld = _referenceTilemap.GetCellCenterWorld(targetCell);
+            cellCenterWorld.z = 0f;
+
+            Vector3 spawnPos = CalculateSpawnPosition(prefab, cellCenterWorld);
+
+            GameObject placed = Instantiate(prefab, spawnPos, Quaternion.identity, _parent);
+
+            PlacedObject placedObject = placed.GetComponent<PlacedObject>();
+            if (placedObject != null) placedObject.Initialize(targetCell, size);
+
+            InstallableObject installable = placed.GetComponent<InstallableObject>();
+            if (installable != null)
+                WorldObjectManager.Instance.RegisterObject(installable, targetCell);
+
+            Debug.Log($"[Placement] 설치 성공 {prefab.name} at {targetCell}");
+            return true;
+        }
+
+        /// <summary>
+        /// PlacementAnchor가 있으면 앵커 오프셋만큼 보정.
+        /// 버그1: 기존 CellToWorld(좌하단) 대신 GetCellCenterWorld(정중앙)를 받아서 처리.
+        /// </summary>
+        private Vector3 CalculateSpawnPosition(GameObject prefab, Vector3 cellCenterWorld)
+        {
+            PlacementAnchor anchor = prefab.GetComponentInChildren<PlacementAnchor>(true);
+            if (anchor == null)
+            {
+                Debug.LogWarning($"[{prefab.name}] PlacementAnchor 없음. 셀 중앙에 설치합니다.");
+                return cellCenterWorld;
+            }
+            return cellCenterWorld - anchor.transform.localPosition;
+        }
+
+        private bool CanPlaceAt(Vector3Int originCell, Vector2Int size)
+        {
+            for (int x = 0; x < size.x; x++)
+            {
+                for (int y = 0; y < size.y; y++)
+                {
+                    Vector3Int cell = new(originCell.x + x, originCell.y + y, originCell.z);
+                    Vector3 worldCenter = _referenceTilemap.GetCellCenterWorld(cell);
+
+                    Collider2D hit = Physics2D.OverlapBox(
+                        worldCenter,
+                        _referenceTilemap.cellSize * 0.9f,
+                        0f,
+                        _blockingLayerMask
+                    );
+
+                    if (hit != null)
+                    {
+                        Debug.Log($"[Placement] blocked by {hit.name}");
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+    }
+}

@@ -1,0 +1,212 @@
+﻿using System;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.Tilemaps;
+using MLT.Core;
+using MLT.Data.ItemSO;
+using MLT.Data;
+
+namespace MLT.Farm
+{
+    public class FarmingManager : MonoBehaviour
+    {
+        public static FarmingManager Instance { get; private set; }
+
+        [Header("연결할 타일맵")]
+        [SerializeField] private Tilemap _baseTilemap;
+        [SerializeField] private Tilemap _cropTilemap;
+
+        [Header("비주얼 에셋")]
+        [SerializeField] private TileBase _tilledTile;
+        [SerializeField] private TileBase _wateredTile;
+        [SerializeField] private TileBase _rottenTile;
+
+        private Dictionary<Vector3Int, FarmTile> _tiles = new();
+        private Dictionary<Sprite, Tile> _tileCache = new();
+
+        private Func<ItemSeedData, bool> _checkCanRemoveSeed;
+
+        public void SetSeedChecker(Func<ItemSeedData, bool> checker)
+            => _checkCanRemoveSeed = checker;
+
+        private void Awake()
+        {
+            if (Instance != null && Instance != this) { Destroy(gameObject); return; }
+            Instance = this;
+        }
+
+        private void Start()
+        {
+            if (TimeManager.Instance != null)
+            {
+                TimeManager.Instance.OnDayStarted += HandleDayStarted;
+                TimeManager.Instance.OnSeasonChanged += HandleSeasonChanged;
+            }
+        }
+
+        private void OnDestroy()
+        {
+            if (TimeManager.Instance != null)
+            {
+                TimeManager.Instance.OnDayStarted -= HandleDayStarted;
+                TimeManager.Instance.OnSeasonChanged -= HandleSeasonChanged;
+            }
+            foreach (var tile in _tileCache.Values)
+                if (tile != null) Destroy(tile);
+            _tileCache.Clear();
+        }
+
+        public void ExecuteAction(ToolType tool, Vector3Int cellPos,
+                                  ItemSeedData seed = null, FertilizerData fertilizer = null)
+        {
+            if (tool == ToolType.HOE && !IsAbleToFarm(cellPos))
+            {
+                Debug.Log("이 타일은 농사를 지을 수 없습니다.");
+                return;
+            }
+
+            FarmTile tile = GetOrCreateTile(cellPos);
+
+            switch (tool)
+            {
+                case ToolType.HOE: tile.Till(); break;
+                case ToolType.WATERING_CAN: tile.Water(); break;
+                case ToolType.SEED: TrySow(tile, seed); break;
+                case ToolType.FERTILIZER:
+                    if (fertilizer != null) tile.Fertilize(fertilizer);
+                    break;
+            }
+        }
+
+        private void TrySow(FarmTile tile, ItemSeedData seed)
+        {
+            if (seed == null) return;
+
+            if (_checkCanRemoveSeed != null && !_checkCanRemoveSeed(seed))
+            {
+                Debug.Log($"[씨앗 부족] {seed._name}이 인벤토리에 없습니다.");
+                return;
+            }
+
+            tile.Sow(seed, TimeManager.Instance.Day);
+            if (tile.CropData == null) return;
+            EventBus.RaiseSeedUsed(seed);
+        }
+
+        public (ItemCropData item, CropQuality quality) HarvestTile(Vector3Int cellPos)
+        {
+            if (_tiles.TryGetValue(cellPos, out var tile))
+            {
+                var (item, quality) = tile.Harvest();
+                if (item != null) EventBus.RaiseHarvested(item, quality);
+                return (item, quality);
+            }
+            return (null, CropQuality.Normal);
+        }
+
+        private bool IsAbleToFarm(Vector3Int cellPos)
+        {
+            TileBaseData tileData = _baseTilemap.GetTile<TileBaseData>(cellPos);
+            return tileData != null && tileData.IsAbleToFarm;
+        }
+
+        private void HandleDayStarted()
+        {
+            bool isRaining = TimeManager.Instance.IsRainyDay;
+            foreach (var tile in _tiles.Values)
+                tile.ProcessDayPass(TimeManager.Instance.Day, isRaining);
+        }
+
+        private void HandleSeasonChanged(Season newSeason)
+        {
+            foreach (var (pos, tile) in _tiles)
+            {
+                tile.KillCrop();
+                RefreshVisual(pos, tile);
+            }
+        }
+
+        private FarmTile GetOrCreateTile(Vector3Int pos)
+        {
+            if (!_tiles.TryGetValue(pos, out var tile))
+            {
+                tile = new FarmTile();
+                _tiles[pos] = tile;
+                tile.OnTileChanged += () => RefreshVisual(pos, tile);
+            }
+            return tile;
+        }
+
+        private void RefreshVisual(Vector3Int pos, FarmTile tile)
+        {
+            // ── 버그9 방어: EMPTY 타일은 baseTilemap을 null로 비우되
+            // cropTilemap도 반드시 null로 비워야 작물 스프라이트 잔상이 남지 않음
+            if (tile.State == FarmState.EMPTY)
+            {
+                _baseTilemap.SetTile(pos, null);
+                _cropTilemap.SetTile(pos, null);
+                return;
+            }
+
+            TileBase soil = tile.State switch
+            {
+                FarmState.ROTTEN => _tilledTile,
+                _ => tile.IsWatered ? _wateredTile : _tilledTile
+            };
+            _baseTilemap.SetTile(pos, soil);
+
+            if (tile.State == FarmState.ROTTEN)
+            {
+                _cropTilemap.SetTile(pos, _rottenTile);
+                return;
+            }
+
+            if (tile.CropData != null)
+            {
+                int elapsed = TimeManager.Instance.Day - tile.SownDay;
+                Sprite sprite = tile.CropData.GetGrowthSprite(elapsed);
+                _cropTilemap.SetTile(pos, GetOrCreateCropTile(sprite));
+            }
+            else
+            {
+                _cropTilemap.SetTile(pos, null);
+            }
+        }
+
+        private Tile GetOrCreateCropTile(Sprite sprite)
+        {
+            if (sprite == null) return null;
+            if (!_tileCache.TryGetValue(sprite, out var tile))
+            {
+                tile = ScriptableObject.CreateInstance<Tile>();
+                tile.sprite = sprite;
+                _tileCache[sprite] = tile;
+            }
+            return tile;
+        }
+
+        // ── 까마귀 시스템 연동 ──────────────────────────────────────
+
+        public List<Vector3Int> GetCropTilePositions()
+        {
+            var result = new List<Vector3Int>();
+            foreach (var (pos, tile) in _tiles)
+            {
+                if (tile.State == FarmState.SEEDED ||
+                    tile.State == FarmState.GROWING ||
+                    tile.State == FarmState.HARVESTABLE)
+                    result.Add(pos);
+            }
+            return result;
+        }
+
+        public int GetCropTileCount() => GetCropTilePositions().Count;
+
+        public void KillCropAt(Vector3Int cellPos)
+        {
+            if (!_tiles.TryGetValue(cellPos, out var tile)) return;
+            tile.KillCrop();
+            RefreshVisual(cellPos, tile);
+        }
+    }
+}
